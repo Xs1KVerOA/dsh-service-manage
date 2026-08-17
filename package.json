@@ -1,0 +1,57 @@
+{
+  "name": "dsh-service-manage",
+  "version": "0.3.0",
+  "description": "Static DeepSeek Harness service manager for FTP, SSH, databases, Docker and S3",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Xs1KVerOA/dsh-service-manage.git"
+  },
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-input-trigger"
+      ]
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh-CN.md",
+    "README.en.md"
+  ],
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@elastic/elasticsearch": "^8.0.0",
+    "@smithy/node-http-handler": "^3.0.0",
+    "basic-ftp": "^5.0.0",
+    "cassandra-driver": "^4.7.0",
+    "dockerode": "^4.0.0",
+    "mongodb": "^6.0.0",
+    "mssql": "^11.0.0",
+    "mysql2": "^3.0.0",
+    "pg": "^8.0.0",
+    "redis": "^4.0.0",
+    "socks": "^2.8.0",
+    "ssh2": "^1.16.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=0.1.0",
+    "@deepseek-ai/dsh-client-ui-sidebar": ">=0.1.0",
+    "@deepseek-ai/dsh-client-ui-input-trigger": ">=0.1.0",
+    "react": ">=18.0.0"
+  }
+}
