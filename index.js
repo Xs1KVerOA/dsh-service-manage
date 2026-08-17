@@ -2,6 +2,7 @@ import { randomInt } from 'node:crypto'
 import { Agent as HttpsAgent } from 'node:https'
 import { createServer } from 'node:net'
 import { PassThrough, Readable } from 'node:stream'
+import { StringDecoder } from 'node:string_decoder'
 import { URL } from 'node:url'
 
 import { DeleteObjectCommand, GetObjectCommand, ListBucketsCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
@@ -17,6 +18,7 @@ import { Client as PgClient } from 'pg'
 import { createClient as createRedisClient } from 'redis'
 import { SocksClient } from 'socks'
 import ssh2 from 'ssh2'
+import { defineTool } from '@deepseek-ai/dsh-tools'
 
 const { Client: SSHClient } = ssh2
 const { Client: CassandraClient, auth: cassandraAuth } = cassandra
@@ -24,7 +26,7 @@ const { Client: CassandraClient, auth: cassandraAuth } = cassandra
 const SECRET_FIELDS = ['password', 'privateKey', 'accessKey', 'secretKey', 'token', 'proxyPassword', 'proxyKey']
 
 export const name = 'dsh-service-manage'
-export const inject = ['webServer']
+export const inject = ['webServer', 'credentials', 'fs', 'tools']
 
 export const TYPES = Object.freeze({
   ssh: { label: 'SSH', port: 22 },
@@ -45,6 +47,20 @@ const TYPE_ALIASES = Object.freeze({ postgres: 'postgresql', postsql: 'postgresq
 const PROXY_TYPES = new Set(['none', 'ssh', 'tcp', 'socks5'])
 const COMPATIBILITY_MODES = new Set(['auto', 'legacy', 'modern'])
 const SAFE_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
+const SERVICE_TOOL_OPERATIONS = Object.freeze([
+  'test', 'query', 'info',
+  'listFiles', 'readFile', 'writeFile', 'deleteFile', 'downloadFile', 'uploadFile',
+  'listDatabases', 'listTables', 'tableData',
+  'listKeys', 'getKey', 'setKey', 'delKey',
+  'listIndices',
+  'listContainers', 'listImages', 'logs', 'start', 'stop', 'exec',
+  'listCollections', 'find',
+  'listKeyspaces',
+  'listBuckets', 'listObjects', 'readObject', 'writeObject', 'deleteObject',
+  'terminalOpen', 'terminalRead', 'terminalWrite', 'terminalResize', 'terminalClose',
+])
+const SERVICE_TOOL_OPERATION_SET = new Set(SERVICE_TOOL_OPERATIONS)
+const REMOTE_SHELL_FALLBACK_PATTERN = /(?:^|[;&|]\s*)(?:env\s+)?(?:sshpass|ssh|sftp|scp|rsync|mysql|mariadb|psql|redis-cli|mongosh|mongo|cqlsh|sqlcmd|docker|ftp|curl|wget|aws|s5cmd)\b|\b(?:paramiko|asyncssh|fabric|ssh2)\b|(?:~\/|\$HOME\/)(?:\.ssh(?:\/|\b)|\.dsh(?:\/|\b))/i
 
 export function normalizeType(value) {
   const key = String(value ?? '').trim().toLowerCase()
@@ -62,6 +78,27 @@ function numberOr(value, fallback) {
   const parsed = Number(value)
   if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) throw new Error('端口必须是 0 到 65535 的整数')
   return parsed
+}
+
+function integerOr(value, fallback, min, max, label) {
+  if (value === '' || value == null) return fallback
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) throw new Error(`${label}必须是 ${min} 到 ${max} 的整数`)
+  return parsed
+}
+
+function selectedDatabase(connection, params) {
+  const value = cleanString(params?.database ?? connection.database ?? '', 256).trim()
+  return value || undefined
+}
+
+function sqlIdentifier(value, label, quote) {
+  const raw = cleanString(value, 512).trim()
+  if (!raw || /[\0\r\n;]/.test(raw) || raw.includes('--') || raw.includes('/*') || raw.includes('*/')) throw new Error(`${label}不合法`)
+  const parts = raw.split('.')
+  if (parts.some(part => !part || part.length > 256)) throw new Error(`${label}不合法`)
+  const escaped = quote === '`' ? part => `\`${part.replaceAll('`', '``')}\`` : part => `"${part.replaceAll('"', '""')}"`
+  return parts.map(escaped).join('.')
 }
 
 function validateHost(value, required) {
@@ -99,13 +136,13 @@ export function validateConnection(input, existing = {}) {
     port: numberOr(source.port ?? existing.port, defaults.port),
     username: cleanString(source.username ?? existing.username ?? '', 256),
     database: cleanString(source.database ?? existing.database ?? '', 256),
-    authMode: source.authMode === 'key' ? 'key' : 'password',
+    authMode: type === 'ssh' && source.authMode === 'key' ? 'key' : 'password',
     options: {
       ...rawOptions,
       compatibility: COMPATIBILITY_MODES.has(rawOptions.compatibility) ? rawOptions.compatibility : 'auto',
       apiVersion: cleanString(rawOptions.apiVersion || '', 32),
       ssl: Boolean(rawOptions.ssl),
-      scheme: rawOptions.scheme === 'https' ? 'https' : 'http',
+      scheme: rawOptions.scheme === 'https' || (type === 's3' && rawOptions.scheme !== 'http') ? 'https' : 'http',
       proxy: validateProxy(rawOptions.proxy),
     },
   }
@@ -123,6 +160,123 @@ function safePath(value, fallback = '/') {
 function resultText(text, extra = {}) { return { ok: true, kind: 'text', text: String(text ?? ''), ...extra } }
 function resultJson(data) { return { ok: true, kind: 'json', data } }
 function resultList(items) { return { ok: true, kind: 'list', items: Array.from(items || [], item => String(item)) } }
+
+function canonicalToolValue(value) {
+  const encoded = JSON.stringify(value, (_key, current) => typeof current === 'bigint' ? String(current) : current)
+  if (encoded === undefined) throw new Error('服务返回结果无法转换为 JSON')
+  return JSON.parse(encoded)
+}
+
+function ansiSequenceEnd(text, start, final) {
+  const length = text.length
+  if (start + 1 >= length) return final ? length : -1
+  const second = text[start + 1]
+  if (second === '[') {
+    for (let index = start + 2; index < length; index++) {
+      const code = text.charCodeAt(index)
+      if (code >= 0x40 && code <= 0x7e) return index + 1
+    }
+    return final ? length : -1
+  }
+  if (second === ']') {
+    for (let index = start + 2; index < length; index++) {
+      if (text.charCodeAt(index) === 0x07) return index + 1
+      if (text.charCodeAt(index) === 0x1b && text[index + 1] === '\\') return index + 2
+    }
+    return final ? length : -1
+  }
+  if (second === 'P' || second === 'X' || second === '^' || second === '_') {
+    for (let index = start + 2; index < length; index++) {
+      if (text.charCodeAt(index) === 0x1b && text[index + 1] === '\\') return index + 2
+    }
+    return final ? length : -1
+  }
+  if (second === '(' || second === ')' || second === '*' || second === '+' || second === '-' || second === '.' || second === '/') {
+    return start + 3 <= length ? start + 3 : (final ? length : -1)
+  }
+  return start + 2
+}
+
+function normalizeTerminalChunk(input, final = false) {
+  const text = String(input ?? '')
+    .replace(/\\u001b/gi, '\x1b')
+    .replace(/\\x1b/gi, '\x1b')
+  let output = ''
+  let index = 0
+  while (index < text.length) {
+    const code = text.charCodeAt(index)
+    if (code === 0x1b) {
+      const end = ansiSequenceEnd(text, index, final)
+      if (end < 0) return { text: output, rest: text.slice(index) }
+      index = end
+      continue
+    }
+    if (code === 0x9b || code === 0x9d || code === 0x90 || code === 0x98 || code === 0x9e || code === 0x9f) {
+      let end = -1
+      if (code === 0x9b) {
+        for (let cursor = index + 1; cursor < text.length; cursor++) {
+          const finalCode = text.charCodeAt(cursor)
+          if (finalCode >= 0x40 && finalCode <= 0x7e) { end = cursor + 1; break }
+        }
+      } else if (code === 0x9d) {
+        for (let cursor = index + 1; cursor < text.length; cursor++) {
+          if (text.charCodeAt(cursor) === 0x07) { end = cursor + 1; break }
+          if (text.charCodeAt(cursor) === 0x1b && text[cursor + 1] === '\\') { end = cursor + 2; break }
+        }
+      } else {
+        for (let cursor = index + 1; cursor < text.length; cursor++) {
+          if (text.charCodeAt(cursor) === 0x1b && text[cursor + 1] === '\\') { end = cursor + 2; break }
+        }
+      }
+      if (end < 0) {
+        if (!final) return { text: output, rest: text.slice(index) }
+        end = text.length
+      }
+      index = end
+      continue
+    }
+    if (code === 0x0d) {
+      output += '\n'
+      index += text.charCodeAt(index + 1) === 0x0a ? 2 : 1
+      continue
+    }
+    if (code === 0x0a || code === 0x09) {
+      output += text[index]
+      index++
+      continue
+    }
+    if (code === 0x08) {
+      if (output && output[output.length - 1] !== '\n') output = output.slice(0, -1)
+      index++
+      continue
+    }
+    if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
+      index++
+      continue
+    }
+    output += text[index]
+    index++
+  }
+  return { text: output, rest: '' }
+}
+
+export function normalizeTerminalText(input) {
+  return normalizeTerminalChunk(input, true).text
+}
+
+function createTerminalOutputNormalizer() {
+  const decoder = new StringDecoder('utf8')
+  let pending = ''
+  const consume = (input, final) => {
+    const result = normalizeTerminalChunk(pending + input, final)
+    pending = result.rest
+    return result.text
+  }
+  return {
+    push(chunk) { return consume(decoder.write(Buffer.from(chunk)), false) },
+    flush() { return consume(decoder.end(), true) },
+  }
+}
 
 function resultRows(rows, fields = []) {
   const safeRows = Array.isArray(rows) ? rows : []
@@ -165,7 +319,11 @@ function parseEndpoint(connection) {
   }
   if (connection.type === 'docker') {
     const raw = connection.options.dockerHost || ''
-    if (!raw || raw.startsWith('unix://') || raw.startsWith('npipe://')) return null
+    if (!raw) {
+      if (!connection.host) return null
+      return { host: connection.host, port: connection.port || 2375, url: undefined }
+    }
+    if (raw.startsWith('unix://') || raw.startsWith('npipe://')) return null
     const url = new URL(raw.includes('://') ? raw : `tcp://${raw}`)
     return { host: url.hostname, port: Number(url.port || (url.protocol === 'https:' ? 2376 : 2375)), url }
   }
@@ -339,7 +497,12 @@ async function execSsh(connection, secrets, network, params) {
 
 function terminalOutput(session) {
   const chunks = session.output.splice(0)
-  return { ok: true, kind: 'terminal', text: Buffer.concat(chunks).toString(), closed: Boolean(session.closed) }
+  if (session.closed && !session.flushed) {
+    session.flushed = true
+    const tail = session.normalizer.flush()
+    if (tail) chunks.push(tail)
+  }
+  return { ok: true, kind: 'terminal', text: chunks.join(''), closed: Boolean(session.closed) }
 }
 
 async function createSshTerminal(connection, secrets, network) {
@@ -348,9 +511,13 @@ async function createSshTerminal(connection, secrets, network) {
     const stream = await new Promise((resolve, reject) => {
       client.shell({ term: 'xterm-256color', cols: 120, rows: 32 }, (error, value) => error ? reject(error) : resolve(value))
     })
-    const session = { client, stream, output: [], closed: false }
-    stream.on('data', chunk => session.output.push(Buffer.from(chunk)))
-    stream.stderr?.on('data', chunk => session.output.push(Buffer.from(chunk)))
+    const session = { client, stream, output: [], closed: false, flushed: false, normalizer: createTerminalOutputNormalizer() }
+    const appendOutput = chunk => {
+      const text = session.normalizer.push(chunk)
+      if (text) session.output.push(text)
+    }
+    stream.on('data', appendOutput)
+    stream.stderr?.on('data', appendOutput)
     stream.once('close', () => { session.closed = true })
     return session
   } catch (error) {
@@ -371,7 +538,8 @@ async function execFtp(connection, secrets, network, params) {
       const chunks = []
       output.on('data', chunk => chunks.push(Buffer.from(chunk)))
       await client.downloadTo(output, path)
-      return resultText(Buffer.concat(chunks).toString('base64'), { encoding: 'base64' })
+      const filename = path.split('/').filter(Boolean).pop() || 'download.bin'
+      return resultText(Buffer.concat(chunks).toString('base64'), { encoding: 'base64', filename })
     }
     if (params.op === 'writeFile') {
       await client.uploadFrom(Readable.from([Buffer.from(cleanString(params.content, 4 * 1024 * 1024))]), path)
@@ -382,14 +550,16 @@ async function execFtp(connection, secrets, network, params) {
   } finally { client.close() }
 }
 
-function redisOptions(connection, secrets, network) {
+function redisOptions(connection, secrets, network, params) {
   const socket = { host: network.host, port: network.port }
   if (connection.options.ssl) Object.assign(socket, { tls: true, ...tlsOptions(connection, connection.host) })
-  return { socket, username: connection.username || undefined, password: secrets.password || undefined, database: connection.options.db == null ? undefined : Number(connection.options.db) }
+  const rawDatabase = params?.database ?? connection.options.db ?? connection.database
+  const database = integerOr(rawDatabase, undefined, 0, 65535, 'Redis DB 编号')
+  return { socket, username: connection.username || undefined, password: secrets.password || undefined, database }
 }
 
 async function execRedis(connection, secrets, network, params) {
-  const client = createRedisClient(redisOptions(connection, secrets, network))
+  const client = createRedisClient(redisOptions(connection, secrets, network, params))
   client.on('error', () => {})
   await client.connect()
   try {
@@ -415,17 +585,19 @@ async function execRedis(connection, secrets, network, params) {
   } finally { await client.quit().catch(() => client.disconnect()) }
 }
 
-function mysqlConfig(connection, secrets, network) {
-  return { host: network.host, port: network.port, user: connection.username || undefined, password: secrets.password || undefined, database: connection.database || undefined, multipleStatements: false, connectTimeout: 15_000, ssl: connection.options.ssl ? tlsOptions(connection, connection.host) : undefined }
+function mysqlConfig(connection, secrets, network, database) {
+  return { host: network.host, port: network.port, user: connection.username || undefined, password: secrets.password || undefined, database: database || undefined, multipleStatements: false, connectTimeout: 15_000, ssl: connection.options.ssl ? tlsOptions(connection, connection.host) : undefined }
 }
 
 async function execMysql(connection, secrets, network, params) {
-  const client = await mysql.createConnection(mysqlConfig(connection, secrets, network))
+  const database = selectedDatabase(connection, params)
+  const client = await mysql.createConnection(mysqlConfig(connection, secrets, network, database))
   try {
     let sql
     if (params.op === 'test') sql = 'SELECT 1 AS ok'
     else if (params.op === 'listDatabases') sql = 'SHOW DATABASES'
     else if (params.op === 'listTables') sql = 'SHOW TABLES'
+    else if (params.op === 'tableData') sql = `SELECT * FROM ${sqlIdentifier(params.table, '表名', '`')} LIMIT ${integerOr(params.limit, 100, 1, 500, '查询数量')}`
     else if (params.op === 'query') sql = cleanString(params.sql || params.text, 131072)
     else throw new Error('不支持的 MySQL/MariaDB 操作')
     const [rows, fields] = await client.query(sql)
@@ -433,18 +605,20 @@ async function execMysql(connection, secrets, network, params) {
   } finally { await client.end() }
 }
 
-function pgConfig(connection, secrets, network) {
-  return { host: network.host, port: network.port, user: connection.username || undefined, password: secrets.password || undefined, database: connection.database || 'postgres', connectionTimeoutMillis: 15_000, ssl: connection.options.ssl ? tlsOptions(connection, connection.host) : undefined }
+function pgConfig(connection, secrets, network, database) {
+  return { host: network.host, port: network.port, user: connection.username || undefined, password: secrets.password || undefined, database: database || 'postgres', connectionTimeoutMillis: 15_000, ssl: connection.options.ssl ? tlsOptions(connection, connection.host) : undefined }
 }
 
 async function execPostgres(connection, secrets, network, params) {
-  const client = new PgClient(pgConfig(connection, secrets, network))
+  const database = selectedDatabase(connection, params)
+  const client = new PgClient(pgConfig(connection, secrets, network, database))
   await client.connect()
   try {
     let sql
     if (params.op === 'test') sql = 'SELECT 1 AS ok'
     else if (params.op === 'listDatabases') sql = 'SELECT datname FROM pg_database ORDER BY datname'
     else if (params.op === 'listTables') sql = "SELECT tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema') ORDER BY tablename"
+    else if (params.op === 'tableData') sql = `SELECT * FROM ${sqlIdentifier(params.table, '表名', '"')} LIMIT ${integerOr(params.limit, 100, 1, 500, '查询数量')}`
     else if (params.op === 'query') sql = cleanString(params.sql || params.text, 131072)
     else throw new Error('不支持的 PostgreSQL 操作')
     const result = await client.query(sql)
@@ -452,22 +626,24 @@ async function execPostgres(connection, secrets, network, params) {
   } finally { await client.end() }
 }
 
-function mssqlConfig(connection, secrets, network) {
-  return { server: network.host, port: network.port, user: connection.username || undefined, password: secrets.password || undefined, database: connection.database || undefined, connectionTimeout: 15_000, requestTimeout: 120_000, options: { encrypt: Boolean(connection.options.ssl), trustServerCertificate: connection.options.tlsRejectUnauthorized === false } }
+function mssqlConfig(connection, secrets, network, database) {
+  return { server: network.host, port: network.port, user: connection.username || undefined, password: secrets.password || undefined, database: database || undefined, connectionTimeout: 15_000, requestTimeout: 120_000, options: { encrypt: Boolean(connection.options.ssl), trustServerCertificate: connection.options.tlsRejectUnauthorized === false } }
 }
 
 async function execMssql(connection, secrets, network, params) {
-  const pool = new mssql.ConnectionPool(mssqlConfig(connection, secrets, network))
+  const database = selectedDatabase(connection, params)
+  const pool = new mssql.ConnectionPool(mssqlConfig(connection, secrets, network, database))
   await pool.connect()
   try {
     let sql
     if (params.op === 'test') sql = 'SELECT 1 AS ok'
     else if (params.op === 'listDatabases') sql = 'SELECT name FROM sys.databases ORDER BY name'
     else if (params.op === 'listTables') sql = "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_SCHEMA, TABLE_NAME"
+    else if (params.op === 'tableData') sql = `SELECT TOP ${integerOr(params.limit, 100, 1, 500, '查询数量')} * FROM ${sqlIdentifier(params.table, '表名', '"')}`
     else if (params.op === 'query') sql = cleanString(params.sql || params.text, 131072)
     else throw new Error('不支持的 MSSQL 操作')
     const result = await pool.request().query(sql)
-    return resultRows(result.recordset || [])
+    return resultRows(result.recordset || [], result.recordset?.columns ? Object.values(result.recordset.columns) : [])
   } finally { await pool.close() }
 }
 
@@ -532,7 +708,7 @@ async function execDocker(connection, network, params) {
   if (params.op === 'listImages') return resultJson(await docker.listImages())
   if (params.op === 'query') return resultJson(await docker.info())
   const container = docker.getContainer(cleanString(params.container, 256))
-  if (params.op === 'logs') return resultText(await container.logs({ stdout: true, stderr: true, tail: Math.min(1000, Math.max(1, Number(params.tail || 200))) }))
+  if (params.op === 'logs') return resultText(await container.logs({ stdout: true, stderr: true, tail: integerOr(params.tail, 200, 1, 1000, '日志行数') }))
   if (params.op === 'start') { await container.start(); return resultText('启动成功') }
   if (params.op === 'stop') { await container.stop(); return resultText('停止成功') }
   if (params.op === 'exec') {
@@ -547,15 +723,15 @@ async function execMongo(connection, secrets, network, params) {
   const client = new MongoClient(uri, { auth: connection.username ? { username: connection.username, password: secrets.password || '' } : undefined, authSource: connection.options.authDatabase || 'admin', tls: Boolean(connection.options.ssl), tlsAllowInvalidCertificates: connection.options.tlsRejectUnauthorized === false, serverSelectionTimeoutMS: 15_000 })
   await client.connect()
   try {
-    const db = client.db(connection.database || 'test')
+    const db = client.db(selectedDatabase(connection, params) || 'test')
     if (params.op === 'test') return resultJson(await db.command({ ping: 1 }))
     if (params.op === 'listDatabases') return resultJson(await client.db().admin().listDatabases())
     if (params.op === 'listCollections') return resultJson(await db.listCollections().toArray())
-    if (params.op === 'find') return resultJson(await db.collection(cleanString(params.collection, 256)).find(parseJson(params.filter || '{}', 'MongoDB Filter')).limit(Math.max(1, Math.min(500, Number(params.limit || 100)))).toArray())
+    if (params.op === 'find') return resultJson(await db.collection(cleanString(params.collection, 256)).find(parseJson(params.filter || '{}', 'MongoDB Filter')).limit(integerOr(params.limit, 100, 1, 500, '返回数量')).toArray())
     if (params.op === 'query') {
       const spec = parseJson(params.text, 'MongoDB 操作')
       const collection = db.collection(cleanString(spec.collection, 256))
-      if (spec.action === 'find') return resultJson(await collection.find(spec.filter || {}).limit(Math.max(1, Math.min(500, Number(spec.limit || 100)))).toArray())
+      if (spec.action === 'find') return resultJson(await collection.find(spec.filter || {}).limit(integerOr(spec.limit, 100, 1, 500, '返回数量')).toArray())
       if (spec.action === 'insertOne') return resultJson(await collection.insertOne(spec.document || {}))
       if (spec.action === 'updateMany') return resultJson(await collection.updateMany(spec.filter || {}, spec.update || {}))
       if (spec.action === 'deleteMany') return resultJson(await collection.deleteMany(spec.filter || {}))
@@ -567,16 +743,17 @@ async function execMongo(connection, secrets, network, params) {
 
 async function execCassandra(connection, secrets, network, params) {
   const authProvider = connection.username ? new cassandraAuth.PlainTextAuthProvider(connection.username, secrets.password || '') : undefined
-  const client = new CassandraClient({ contactPoints: [network.host], localDataCenter: connection.options.localDataCenter || 'datacenter1', protocolOptions: { port: network.port }, authProvider })
+  const client = new CassandraClient({ contactPoints: [network.host], localDataCenter: connection.options.localDataCenter || 'datacenter1', protocolOptions: { port: network.port }, sslOptions: connection.options.ssl ? tlsOptions(connection, connection.host) : undefined, authProvider })
   await client.connect()
   try {
     let cql
     if (params.op === 'test') cql = 'SELECT now() AS now FROM system.local'
     else if (params.op === 'listKeyspaces') cql = 'SELECT keyspace_name FROM system_schema.keyspaces'
-    else if (params.op === 'listTables') {
-      const keyspace = cleanString(connection.options.keyspace || connection.database, 256)
+    else if (params.op === 'listTables' || params.op === 'tableData') {
+      const keyspace = cleanString(params.keyspace ?? connection.options.keyspace ?? connection.database, 256).trim()
       if (!keyspace) throw new Error('列出 Cassandra 表需要填写 Keyspace')
-      cql = `SELECT table_name FROM system_schema.tables WHERE keyspace_name = '${keyspace.replaceAll("'", "''")}'`
+      if (params.op === 'listTables') cql = `SELECT table_name FROM system_schema.tables WHERE keyspace_name = '${keyspace.replaceAll("'", "''")}'`
+      else cql = `SELECT * FROM ${sqlIdentifier(keyspace, 'Keyspace', '"')}.${sqlIdentifier(params.table, '表名', '"')} LIMIT ${integerOr(params.limit, 100, 1, 500, '查询数量')}`
     } else if (params.op === 'query') cql = cleanString(params.cql || params.text, 131072)
     else throw new Error('不支持的 Cassandra 操作')
     return resultRows((await client.execute(cql)).rows)
@@ -587,7 +764,10 @@ function s3Client(connection, secrets, network) {
   const endpoint = network.localEndpoint || connection.options.endpoint || `${connection.options.scheme || 'https'}://s3.amazonaws.com`
   const parsed = new URL(endpoint)
   const config = { region: connection.options.region || 'us-east-1', endpoint, forcePathStyle: Boolean(connection.options.endpoint) || Boolean(network.localEndpoint) }
-  if (secrets.accessKey && secrets.secretKey) config.credentials = { accessKeyId: secrets.accessKey, secretAccessKey: secrets.secretKey, ...(secrets.token ? { sessionToken: secrets.token } : {}) }
+  const hasAccessKey = Boolean(secrets.accessKey)
+  const hasSecretKey = Boolean(secrets.secretKey)
+  if (hasAccessKey !== hasSecretKey) throw new Error('S3 Access Key 和 Secret Key 必须同时填写')
+  if (hasAccessKey) config.credentials = { accessKeyId: secrets.accessKey, secretAccessKey: secrets.secretKey, ...(secrets.token ? { sessionToken: secrets.token } : {}) }
   if (network.localEndpoint && parsed.protocol === 'https:') config.requestHandler = new NodeHttpHandler({ httpsAgent: new HttpsAgent({ servername: network.endpoint.host, rejectUnauthorized: connection.options.tlsRejectUnauthorized !== false }) })
   return new S3Client(config)
 }
@@ -600,7 +780,10 @@ async function execS3(connection, secrets, network, params) {
     if (!['test', 'listBuckets'].includes(params.op) && !bucket) throw new Error('S3 操作需要 bucket')
     if (params.op === 'test' || params.op === 'listBuckets') return resultJson(await client.send(new ListBucketsCommand({})))
     if (params.op === 'listObjects') return resultJson(await client.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: cleanString(params.prefix || '', 2048) || undefined })))
-    if (params.op === 'readObject') return resultText((await streamToBuffer((await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }))).Body)).toString('base64'), { encoding: 'base64' })
+    if (params.op === 'readObject') {
+      const filename = key.split('/').filter(Boolean).pop() || 'download.bin'
+      return resultText((await streamToBuffer((await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }))).Body)).toString('base64'), { encoding: 'base64', filename })
+    }
     if (params.op === 'writeObject') { await client.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: Buffer.from(cleanString(params.content, 16 * 1024 * 1024)) })); return resultText('写入成功') }
     if (params.op === 'deleteObject') { await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key })); return resultText('删除成功') }
     throw new Error('不支持的 S3 操作')
@@ -655,6 +838,7 @@ export function apply(ctx) {
   if (!webServer) return
   const fs = ctx.get('fs')
   const credentials = ctx.get('credentials')
+  const tools = ctx.get('tools')
   const sandboxPolicy = ctx.get('sandboxPolicy')
   const workspaceRoot = typeof sandboxPolicy?.workspaceRoot === 'string' ? sandboxPolicy.workspaceRoot : process.cwd()
   const activeTunnels = new Set()
@@ -800,6 +984,65 @@ export function apply(ctx) {
     const secrets = await readSecrets(connection.id)
     if (connection.type === 'ssh' && String(args.params?.op || '').startsWith('terminal')) return terminalAction(connection, secrets, args.params || {})
     return withNetwork(connection, secrets, network => executeConnection(connection, secrets, network, args.params || {}), activeTunnels)
+  }
+
+  function connectionAlias(connection, connections) {
+    const name = String(connection.name || '').trim()
+    const base = /^[A-Za-z0-9_-]+$/.test(name) ? name : String(connection.id)
+    const duplicate = connections.some(item => {
+      if (String(item.id) === String(connection.id)) return false
+      const itemName = String(item.name || '').trim()
+      return (/^[A-Za-z0-9_-]+$/.test(itemName) ? itemName : String(item.id)) === base
+    })
+    return duplicate ? `${base}_${connection.id}` : base
+  }
+
+  function resolveConnectionReference(config, value) {
+    const raw = cleanString(value, 256).trim()
+    const token = raw.replace(/^@/, '')
+    if (!token) throw new Error('服务器引用不能为空')
+    const connection = config.connections.find(item => item.id === token || item.name === token || connectionAlias(item, config.connections) === token)
+    if (!connection) throw new Error(`服务器引用不存在: ${token}`)
+    return connection
+  }
+
+  if (tools) {
+    ctx.tools.register(defineTool({
+      name: 'dsh_server_manage',
+      description: [
+        'Operate a configured server through the dsh-service-manage Node.js SDK channel.',
+        'Use this tool whenever the user provides a <dsh-server-ref> or @server reference.',
+        'The plugin resolves credentials through the DSH credentials service and opens the configured SSH/TCP/proxy channel internally.',
+        'Never use bash, shell, ssh, sshpass, paramiko, local ~/.ssh files, ~/.dsh/.credentials.yaml, or environment variables to access a referenced server.',
+        'For SSH terminals call terminalOpen, then terminalRead/terminalWrite, and terminalClose when finished.',
+        'Credentials and proxy secrets are never returned by this tool.',
+      ].join(' '),
+      parameters: {
+        server: { type: 'string', required: true, description: 'Configured server id, name, alias, or @alias from dsh-server-ref.' },
+        operation: { type: 'string', required: true, enum: SERVICE_TOOL_OPERATIONS, description: 'Service operation to execute.' },
+        params: { type: 'object', additionalProperties: true, description: 'Operation parameters, such as path, text, database, table, bucket, or terminalId.' },
+      },
+      output: {
+        schema: { type: 'object', additionalProperties: true },
+        render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+      },
+      async execute(args, exec) {
+        if (exec.signal.aborted) throw new Error('服务操作已取消')
+        const config = await readConfig()
+        const connection = resolveConnectionReference(config, args.server)
+        if (!SERVICE_TOOL_OPERATION_SET.has(args.operation)) throw new Error(`不支持的服务操作: ${args.operation}`)
+        const params = args.params && typeof args.params === 'object' ? args.params : {}
+        const result = canonicalToolValue(await execConnection({ id: connection.id, params: { ...params, op: args.operation } }))
+        if (exec.signal.aborted) throw new Error('服务操作已取消')
+        return result
+      },
+    }))
+    tools.guard(execution => {
+      if (!['bash', 'pwsh'].includes(execution.name)) return undefined
+      const command = String(execution.arguments?.command || '')
+      if (!REMOTE_SHELL_FALLBACK_PATTERN.test(command)) return undefined
+      return '访问已配置服务器必须使用 dsh_server_manage；请勿通过本地 shell、SSH/数据库/服务 CLI、sshpass、paramiko 或本机凭据文件建立远程连接。'
+    })
   }
 
   async function handler(req, res) {
