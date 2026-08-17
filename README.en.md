@@ -15,31 +15,45 @@
 
 ## Installation
 
+Requires Node.js `>=22.19.0` and DeepSeek Harness `0.1.0-rc.6` or newer.
+
 ### Install from GitHub
 
 ```sh
-dsh plugin --profile demo add https://github.com/Xs1KVerOA/dsh-service-manage.git
-dsh --profile demo --dump-config
-dsh web --profile demo
+npx @deepseek-ai/dsh plugin --profile web add --allow-build=ssh2 --allow-build=cpu-features --allow-build=protobufjs https://github.com/Xs1KVerOA/dsh-service-manage.git
+npx @deepseek-ai/dsh --profile web --dump-config
+npx @deepseek-ai/dsh web
 ```
+
+The `--allow-build` flags explicitly approve the `ssh2`, `cpu-features`, and `protobufjs` dependency scripts for the current DSH/pnpm profile installer. If a machine has no C/C++ toolchain, SSH falls back to its pure-JavaScript implementation; the optional native binding is not required for the basic feature set.
 
 ### Install from a local checkout
 
 ```sh
-dsh plugin --profile demo add /Users/xinyu.ke/Desktop/dsh/static-plugin
-dsh --profile demo --dump-config
-dsh web --profile demo
+git clone https://github.com/Xs1KVerOA/dsh-service-manage.git
+cd dsh-service-manage
+npm install
+npx @deepseek-ai/dsh plugin --profile web add --allow-build=ssh2 --allow-build=cpu-features --allow-build=protobufjs "$PWD"
+npx @deepseek-ai/dsh web
 ```
 
-The package is an installable static bundle. `cordis.patch.yml` registers the plugin entry, and no dynamic Cordis Runner is required. The patch can also be used as an absolute-path overlay.
+The package is an installable static bundle. `cordis.patch.yml` registers the plugin entry, and no dynamic Cordis Runner is required. Runtime dependencies, including `@deepseek-ai/dsh-tools`, are declared in `dependencies`, so cloning from GitHub and running `npm install` produces the same runtime dependency set as the development checkout. The patch can also be used as an absolute-path overlay.
 
 ### Install from dsh.so
 
 After approval and registry publication, the recommended installation is by package name:
 
 ```sh
-dsh plugin --profile web add dsh-service-manage
-dsh web
+npx @deepseek-ai/dsh plugin --profile web add --allow-build=ssh2 --allow-build=cpu-features --allow-build=protobufjs dsh-service-manage
+npx @deepseek-ai/dsh web
+```
+
+### Install a release tarball
+
+Run `npm run pack:release` in the repository root to generate `dsh-service-manage-0.3.1.tgz`, then install it into a profile:
+
+```sh
+npx @deepseek-ai/dsh plugin --profile web add --allow-build=ssh2 --allow-build=cpu-features --allow-build=protobufjs ./dsh-service-manage-0.3.1.tgz
 ```
 
 ## Compatibility and implementation
@@ -47,7 +61,7 @@ dsh web
 - The Host side uses Node.js SDKs; the browser side declares Sidebar and `@` input-trigger dependencies through `dsh.client.inject`.
 - `cordis.patch.yml` registers the bundle with the stable plugin ID `dsh-service-manage`.
 - Compatibility modes adjust protocol/API parameters for the selected service; the plugin does not copy service clients into the Harness Host.
-- DSH core packages are declared as peer dependencies to avoid duplicate Cordis or client singletons.
+- DSH `cordis`, `credentials`, `fs`, and client capabilities are declared as peer dependencies to match the Harness runtime; the Node SDKs and `@deepseek-ai/dsh-tools` required by this plugin are declared as runtime dependencies so GitHub installs do not depend on a local Harness checkout.
 
 ## Usage
 
@@ -59,10 +73,10 @@ dsh web
 For names containing spaces or non-ASCII characters, the candidate uses a safe server ID as the input alias. A submitted reference looks like this:
 
 ```xml
-<dsh-server-ref id="srv_xxx" name="Production database" type="mysql" endpoint="db.example.com:3306" database="app" />
+<dsh-server-ref id="srv_xxx" name="Production database" alias="prod-db" type="mysql" transport="service-manager" tool="dsh_server_manage" credential-scope="dsh-credentials" endpoint="db.example.com:3306" database="app" />
 ```
 
-References contain only connection metadata such as ID, name, type, endpoint, database, and compatibility/proxy mode. Passwords, private keys, and cloud credentials are never included. A reference does not automatically execute remote writes, deletes, or commands; those actions still require an explicit operation in the service-management UI.
+References contain only connection metadata such as ID, name, alias, type, endpoint, database, and transport. Passwords, private keys, and cloud credentials are never included. The model should call `dsh_server_manage` for a reference; the plugin resolves secrets through the DSH credentials service and uses the managed Node SDK, SSH/TCP, or SOCKS5 channel. A guard rejects attempts to bypass the service manager through `bash/pwsh`, `sshpass`, database CLIs, or local credential files.
 
 ## Node SDKs
 
@@ -107,8 +121,8 @@ Start with **Test connection**, then check host/port, credentials, TLS, compatib
 ## Development and validation
 
 ```sh
-node --check index.js
-node --check client.js
+npm install
+npm run check
 npm pack --dry-run
 ```
 

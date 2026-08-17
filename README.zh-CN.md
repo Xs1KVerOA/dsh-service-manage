@@ -15,31 +15,45 @@
 
 ## 安装
 
+要求 Node.js `>=22.19.0`，以及 DeepSeek Harness `0.1.0-rc.6` 或更高版本。
+
 ### 从 GitHub 安装
 
 ```sh
-dsh plugin --profile demo add https://github.com/Xs1KVerOA/dsh-service-manage.git
-dsh --profile demo --dump-config
-dsh web --profile demo
+npx @deepseek-ai/dsh plugin --profile web add --allow-build=ssh2 --allow-build=cpu-features --allow-build=protobufjs https://github.com/Xs1KVerOA/dsh-service-manage.git
+npx @deepseek-ai/dsh --profile web --dump-config
+npx @deepseek-ai/dsh web
 ```
+
+命令中的 `--allow-build` 是当前 DSH/pnpm profile 安装器对 `ssh2`、`cpu-features` 和 `protobufjs` 安装脚本的显式批准；如果系统没有 C/C++ 编译工具，SSH 仍会使用纯 JavaScript fallback（可选 native binding 不影响基本功能）。
 
 ### 从本地目录安装
 
 ```sh
-dsh plugin --profile demo add /Users/xinyu.ke/Desktop/dsh/static-plugin
-dsh --profile demo --dump-config
-dsh web --profile demo
+git clone https://github.com/Xs1KVerOA/dsh-service-manage.git
+cd dsh-service-manage
+npm install
+npx @deepseek-ai/dsh plugin --profile web add --allow-build=ssh2 --allow-build=cpu-features --allow-build=protobufjs "$PWD"
+npx @deepseek-ai/dsh web
 ```
 
-插件是可安装的静态 bundle，入口由 `cordis.patch.yml` 注册，不依赖动态 Cordis Runner。也可以将该 patch 文件作为绝对路径 overlay 使用。
+插件是可安装的静态 bundle，入口由 `cordis.patch.yml` 注册，不依赖动态 Cordis Runner。运行时依赖（包括 `@deepseek-ai/dsh-tools`）已写入 `dependencies`，从 GitHub 下载后执行 `npm install` 即可获得与本机一致的运行时依赖。也可以将该 patch 文件作为绝对路径 overlay 使用。
 
 ### 从 dsh.so 安装
 
 审核通过并进入 registry 后，推荐使用包名安装：
 
 ```sh
-dsh plugin --profile web add dsh-service-manage
-dsh web
+npx @deepseek-ai/dsh plugin --profile web add --allow-build=ssh2 --allow-build=cpu-features --allow-build=protobufjs dsh-service-manage
+npx @deepseek-ai/dsh web
+```
+
+### 安装 release 包
+
+在仓库根目录执行 `npm run pack:release` 生成 `dsh-service-manage-0.3.1.tgz`，然后安装到 profile：
+
+```sh
+npx @deepseek-ai/dsh plugin --profile web add --allow-build=ssh2 --allow-build=cpu-features --allow-build=protobufjs ./dsh-service-manage-0.3.1.tgz
 ```
 
 ## 兼容性与实现
@@ -47,7 +61,7 @@ dsh web
 - Host 侧使用 Node.js SDK，前端侧通过 `dsh.client.inject` 接入 Sidebar 和 `@` 输入触发器。
 - `cordis.patch.yml` 使用稳定插件 ID `dsh-service-manage` 注册 bundle。
 - 兼容模式只影响对应服务的协议/API 参数，不会把一个服务的客户端库复制到 Harness Host 中。
-- DSH 核心依赖通过 `peerDependencies` 声明，避免重复加载 Cordis 或客户端单例。
+- DSH 的 `cordis`、`credentials`、`fs` 和客户端能力通过 `peerDependencies` 对齐 Harness 运行时；插件自身需要的 Node SDK 和 `@deepseek-ai/dsh-tools` 通过 `dependencies` 安装，避免从 GitHub 下载后出现模块缺失。
 
 ## 使用方式
 
@@ -59,10 +73,10 @@ dsh web
 服务器名称包含中文或空格时，候选项会使用安全 ID 作为可输入别名。提交会话时引用形如：
 
 ```xml
-<dsh-server-ref id="srv_xxx" name="生产数据库" type="mysql" endpoint="db.example.com:3306" database="app" />
+<dsh-server-ref id="srv_xxx" name="生产数据库" alias="prod-db" type="mysql" transport="service-manager" tool="dsh_server_manage" credential-scope="dsh-credentials" endpoint="db.example.com:3306" database="app" />
 ```
 
-引用只包含连接 ID、名称、类型、地址、端口、数据库和兼容/代理模式等元数据，不包含密码、私钥或云密钥。引用本身不会自动执行远程写入、删除或命令；这些操作仍需在服务管理界面中明确触发。
+引用只包含连接 ID、名称、别名、类型、地址、数据库和通道元数据，不包含密码、私钥或云密钥。模型收到引用后应调用 `dsh_server_manage`；该 Tool 在插件内部通过 DSH credentials service 解析密钥，并复用服务管理的 Node SDK、SSH/TCP/SOCKS5 通道。插件会拒绝模型通过 `bash/pwsh`、`sshpass`、数据库 CLI 或本机凭据文件绕过服务管理连接服务器。
 
 ## 支持的 Node SDK
 
@@ -107,8 +121,8 @@ dsh web
 ## 开发与验证
 
 ```sh
-node --check index.js
-node --check client.js
+npm install
+npm run check
 npm pack --dry-run
 ```
 
