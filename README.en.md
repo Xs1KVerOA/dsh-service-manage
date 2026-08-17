@@ -33,6 +33,22 @@ dsh web --profile demo
 
 The package is an installable static bundle. `cordis.patch.yml` registers the plugin entry, and no dynamic Cordis Runner is required. The patch can also be used as an absolute-path overlay.
 
+### Install from dsh.so
+
+After approval and registry publication, the recommended installation is by package name:
+
+```sh
+dsh plugin --profile web add dsh-service-manage
+dsh web
+```
+
+## Compatibility and implementation
+
+- The Host side uses Node.js SDKs; the browser side declares Sidebar and `@` input-trigger dependencies through `dsh.client.inject`.
+- `cordis.patch.yml` registers the bundle with the stable plugin ID `dsh-service-manage`.
+- Compatibility modes adjust protocol/API parameters for the selected service; the plugin does not copy service clients into the Harness Host.
+- DSH core packages are declared as peer dependencies to avoid duplicate Cordis or client singletons.
+
 ## Usage
 
 1. Open **Service Management** below the workspace sidebar.
@@ -74,6 +90,20 @@ References contain only connection metadata such as ID, name, type, endpoint, da
 - SSH, SOCKS5, and TCP forwarding tunnels are owned by the plugin lifecycle and are closed when the plugin or terminal is disposed.
 - Writes, deletes, SQL/CQL, remote commands, and container start/stop operations can have real side effects. Use the plugin only with authorized services.
 
+## FAQ
+
+### The `@` candidate list is empty
+
+Save at least one connection in **Service Management**, then focus the conversation input again. For names containing spaces or non-ASCII characters, choose the safe ID from the candidate menu; ASCII-safe names can be confirmed by typing `@name` followed by a space.
+
+### The sidebar entry is missing after installation
+
+Make sure the package is installed as `dsh-service-manage` and restart the relevant `dsh web` profile. The client bundle depends on the Sidebar and input-trigger capabilities; a profile missing those capabilities cannot provide the complete UI.
+
+### A connection fails
+
+Start with **Test connection**, then check host/port, credentials, TLS, compatibility mode, and proxy/jump-host settings. Passwords and private keys are never written to `.dsh-servers.json`.
+
 ## Development and validation
 
 ```sh
@@ -83,3 +113,7 @@ npm pack --dry-run
 ```
 
 `index.js` contains the Host-side Node SDK implementation. `client.js` contains the static Web UI and the `@` input-trigger source. The `dsh.client.inject` declaration in `package.json` declares the Sidebar and input-trigger dependencies.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -33,6 +33,22 @@ dsh web --profile demo
 
 插件是可安装的静态 bundle，入口由 `cordis.patch.yml` 注册，不依赖动态 Cordis Runner。也可以将该 patch 文件作为绝对路径 overlay 使用。
 
+### 从 dsh.so 安装
+
+审核通过并进入 registry 后，推荐使用包名安装：
+
+```sh
+dsh plugin --profile web add dsh-service-manage
+dsh web
+```
+
+## 兼容性与实现
+
+- Host 侧使用 Node.js SDK，前端侧通过 `dsh.client.inject` 接入 Sidebar 和 `@` 输入触发器。
+- `cordis.patch.yml` 使用稳定插件 ID `dsh-service-manage` 注册 bundle。
+- 兼容模式只影响对应服务的协议/API 参数，不会把一个服务的客户端库复制到 Harness Host 中。
+- DSH 核心依赖通过 `peerDependencies` 声明，避免重复加载 Cordis 或客户端单例。
+
 ## 使用方式
 
 1. 打开工作区下方的“服务管理”。
@@ -74,6 +90,20 @@ dsh web --profile demo
 - SSH、SOCKS5 和 TCP 转发隧道由插件生命周期管理；插件卸载时会关闭隧道和终端。
 - 写入、删除、SQL/CQL、远程命令以及容器启停都可能产生真实副作用，请只对受授权的服务使用。
 
+## 常见问题
+
+### `@` 候选列表为空
+
+先在“服务管理”中保存至少一个连接，再重新聚焦会话输入框。连接名称包含中文或空格时，请从候选菜单选择安全 ID；ASCII 名称可以输入 `@name` 后按空格确认。
+
+### 安装后侧边栏没有入口
+
+确认安装的是 `dsh-service-manage` 包名，并重启对应的 `dsh web` profile。客户端 bundle 依赖 Sidebar 和输入触发器，profile 缺少这些能力时插件不会提供完整 UI。
+
+### 连接失败
+
+先执行“测试连接”，再分别检查地址/端口、认证密钥、TLS、兼容模式和代理跳板机。插件不会把密码或私钥写入 `.dsh-servers.json`。
+
 ## 开发与验证
 
 ```sh
@@ -83,3 +113,7 @@ npm pack --dry-run
 ```
 
 插件由 `index.js` 提供 Host 侧 Node SDK 逻辑，由 `client.js` 提供静态 Web UI 和 `@` 输入触发器。`package.json` 中的 `dsh.client.inject` 声明了 Sidebar 和输入触发器依赖。
+
+## License
+
+MIT，见 [LICENSE](LICENSE)。

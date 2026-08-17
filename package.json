@@ -1,7 +1,18 @@
 {
   "name": "dsh-service-manage",
   "version": "0.3.0",
-  "description": "Static DeepSeek Harness service manager for FTP, SSH, databases, Docker and S3",
+  "description": "Node.js SDK-based DeepSeek Harness service manager for SSH/FTP, databases, Docker, Elasticsearch, MongoDB, Cassandra and S3, with proxy support, SSH SFTP/terminal and @ server references",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "service-management",
+    "ssh",
+    "database",
+    "docker",
+    "s3"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/Xs1KVerOA/dsh-service-manage.git"
